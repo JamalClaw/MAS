@@ -14,6 +14,7 @@ def main():
     summaries = {}
     for name in SCENARIOS:
         cfg = scenario_config(name)
+        cfg.strategy = "advanced"
         cfg.max_time_steps = 300
         sim = WarehouseSimulation(cfg)
         summaries[name] = sim.run(output_dir=out_root / name, render=False)

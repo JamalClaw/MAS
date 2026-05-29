@@ -10,6 +10,7 @@ from swarm_warehouse.simulation import WarehouseSimulation, scenario_config
 def parse_args():
     p = argparse.ArgumentParser(description="Swarm Logistics & Warehouse Automation simulator")
     p.add_argument("--scenario", default="baseline", choices=["baseline", "high_load", "high_density", "deadlock", "dynamic", "scalability"])
+    p.add_argument("--strategy", default="advanced", choices=["advanced", "naive"], help="agent coordination strategy")
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--agents", type=int, default=None)
     p.add_argument("--task-rate", type=float, default=None)
@@ -22,6 +23,7 @@ def parse_args():
 def main():
     args = parse_args()
     config = scenario_config(args.scenario)
+    config.strategy = args.strategy
     if args.steps is not None:
         config.max_time_steps = args.steps
     if args.agents is not None:

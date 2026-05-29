@@ -135,3 +135,4 @@ class SimulationConfig:
     enable_pygame: bool = False
     render_delay_ms: int = 80
     scenario: str = "baseline"
+    strategy: str = "advanced"  # "advanced" or "naive"

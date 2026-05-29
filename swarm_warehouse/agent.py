@@ -112,6 +112,37 @@ class RobotAgent:
             self.next_cell = self.position
             self.waiting_time += 1
 
+
+    def plan_or_replan_naive(self, planner, task_pool, current_time: int, metrics) -> None:
+        """Plan using ordinary A* only, without cooperative reservations.
+
+        This is used by the naive baseline strategy. It intentionally ignores
+        future space-time reservations, congestion, edge-swap prevention, and
+        deadlock recovery so it can serve as a simple baseline controller.
+        """
+        target = self.target_cell(task_pool)
+        if target is None:
+            return
+        if self.path and not self.needs_replan and self.path_index < len(self.path):
+            return
+        self.state = AgentState.REPLANNING if self.needs_replan else self.state
+        path = planner.a_star(self.position, target)
+        if path:
+            self.path = path
+            self.path_index = 0
+            self.needs_replan = False
+            self.replanning_count += 1
+            if self.carrying_item:
+                self.state = AgentState.MOVING_TO_DROPOFF
+            else:
+                self.state = AgentState.MOVING_TO_PICKUP
+            metrics.log_event(current_time, "NAIVE_PATH_PLANNED", self.agent_id, task_id=self.assigned_task_id, details="standard A* path planned")
+        else:
+            self.selected_action = ActionType.WAIT
+            self.next_cell = self.position
+            self.waiting_time += 1
+            metrics.log_event(current_time, "NAIVE_PATH_FAILED", self.agent_id, task_id=self.assigned_task_id, details="standard A* failed")
+
     def prepare_intent(self, task_pool, current_time: int) -> MovementIntent:
         self.selected_action = ActionType.WAIT
         self.next_cell = self.position

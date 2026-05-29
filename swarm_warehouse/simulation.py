@@ -83,6 +83,39 @@ class WarehouseSimulation:
     def agents_by_id(self) -> Dict[int, RobotAgent]:
         return {a.agent_id: a for a in self.agents}
 
+    def _assign_tasks_naive(self, current_time: int) -> None:
+        """Greedy nearest-agent task assignment for the naive baseline.
+
+        This intentionally avoids auction bidding and congestion-aware utility.
+        It is included to provide a real baseline strategy for validation.
+        """
+        for task in list(self.task_pool.unassigned()):
+            candidates = []
+            for agent in self.agents:
+                if not agent.can_bid():
+                    continue
+                p1 = self.planner.a_star(agent.position, task.pickup)
+                p2 = self.planner.a_star(task.pickup, task.dropoff)
+                if p1 is None or p2 is None:
+                    continue
+                cost = max(0, len(p1) - 1) + max(0, len(p2) - 1)
+                candidates.append((cost, agent.agent_id, agent))
+            if not candidates:
+                continue
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            cost, _, winner = candidates[0]
+            if self.task_pool.assign_task(task.task_id, winner.agent_id):
+                winner.assign_task(task.task_id)
+                winner.bid_values.append(float(cost))
+                self.metrics.log_event(
+                    current_time,
+                    "NAIVE_TASK_ASSIGNED",
+                    winner.agent_id,
+                    task_id=task.task_id,
+                    details=f"nearest=A{winner.agent_id}, distance_cost={cost}",
+                    resolution="nearest idle agent; lowest agent_id tie-breaker",
+                )
+
     def step(self) -> None:
         self.time_step += 1
         t = self.time_step
@@ -93,6 +126,66 @@ class WarehouseSimulation:
         if new_task:
             self.metrics.log_event(t, "TASK_CREATED", task_id=new_task.task_id, details=f"{new_task.pickup}->{new_task.dropoff}")
 
+        if self.config.strategy == "naive":
+            self._step_naive_control(t)
+        else:
+            self._step_advanced_control(t)
+
+        # Execute synchronously.
+        for agent in self.agents:
+            if agent.waiting_time > self.config.wait_threshold and agent.assigned_task_id is not None:
+                agent.needs_replan = True
+            agent.execute(self.task_pool, t, self.metrics)
+            self.metrics.log_agent_decision(t, agent)
+
+        # Validate actual collisions after execution.
+        # A collision is counted through log_event only; do not increment twice.
+        positions = {}
+        for agent in self.agents:
+            if agent.position in positions:
+                self.metrics.log_event(t, "COLLISION_EVENT", agent.agent_id, related_agents=[positions[agent.position]], cell=agent.position, details="post-step collision")
+            positions[agent.position] = agent.agent_id
+        # Update grid occupancy. In naive mode, actual collisions can occur; keep
+        # one representative occupant per collided cell so the simulation can
+        # continue and the collision remains recorded in the metrics.
+        if self.config.strategy == "naive":
+            unique_positions = {}
+            occupied_cells = set()
+            for a in self.agents:
+                if a.position not in occupied_cells:
+                    unique_positions[a.agent_id] = a.position
+                    occupied_cells.add(a.position)
+            self.grid.set_agent_positions(unique_positions)
+        else:
+            self.grid.set_agent_positions({a.agent_id: a.position for a in self.agents})
+        self.metrics.snapshot(t, self.agents, self.task_pool, self.grid)
+
+    def _step_naive_control(self, t: int) -> None:
+        # Greedy task assignment: nearest idle agent, no auction and no congestion-aware cost.
+        self._assign_tasks_naive(t)
+
+        # Standard A* only: no cooperative reservations.
+        for agent in self.agents:
+            if agent.assigned_task_id is not None:
+                agent.plan_or_replan_naive(self.planner, self.task_pool, t, self.metrics)
+
+        intents = [a.prepare_intent(self.task_pool, t) for a in self.agents]
+
+        # Naive safety logic: only current occupancy and static obstacles are checked.
+        # It intentionally does not prevent duplicate future targets, edge swaps, or deadlocks.
+        occupied = {a.position: a.agent_id for a in self.agents}
+        for intent in intents:
+            agent = self.agents_by_id[intent.agent_id]
+            if intent.action == ActionType.MOVE:
+                if not self.grid.valid_move_target(intent.next_cell):
+                    agent.force_wait(None)
+                    self.metrics.log_event(t, "INVALID_MOVE_PREVENTED", agent.agent_id, cell=intent.next_cell, details="naive: outside grid or obstacle")
+                elif intent.next_cell in occupied and occupied[intent.next_cell] != agent.agent_id:
+                    other = occupied[intent.next_cell]
+                    agent.force_wait(other)
+                    self.metrics.log_event(t, "INVALID_MOVE_PREVENTED", agent.agent_id, related_agents=[other], cell=intent.next_cell, details="naive: occupied target")
+
+    def _step_advanced_control(self, t: int) -> None:
         # Deterministic decentralized auction protocol phase.
         self.auction.run(self.agents, self.task_pool, self.planner, self.reservations, t, self.metrics)
 
@@ -139,8 +232,7 @@ class WarehouseSimulation:
             if a.waiting_time > self.config.wait_threshold:
                 a.needs_replan = True
 
-        # Final safety gate. Conflict resolution can create secondary blocking cases
-        # (for example, A was allowed to enter B's cell, then B was forced to wait).
+        # Final safety gate. Conflict resolution can create secondary blocking cases.
         # This loop converts any remaining unsafe move into WAIT before execution.
         for _ in range(len(self.agents) + 1):
             changed = False
@@ -183,24 +275,6 @@ class WarehouseSimulation:
             for aid in cycle:
                 self.agents_by_id[aid].deadlocks_involved += 1
             self.deadlock_detector.resolve(cycle, self.agents_by_id, self.reservations, self.conflict_resolver, t, self.metrics)
-
-        # Execute synchronously.
-        old_positions = {a.agent_id: a.position for a in self.agents}
-        for agent in self.agents:
-            if agent.waiting_time > self.config.wait_threshold and agent.assigned_task_id is not None:
-                agent.needs_replan = True
-            agent.execute(self.task_pool, t, self.metrics)
-            self.metrics.log_agent_decision(t, agent)
-
-        # Validate no actual collision after execution.
-        positions = {}
-        for agent in self.agents:
-            if agent.position in positions:
-                self.metrics.collision_events += 1
-                self.metrics.log_event(t, "COLLISION_EVENT", agent.agent_id, related_agents=[positions[agent.position]], cell=agent.position, details="post-step collision")
-            positions[agent.position] = agent.agent_id
-        self.grid.set_agent_positions({a.agent_id: a.position for a in self.agents})
-        self.metrics.snapshot(t, self.agents, self.task_pool, self.grid)
 
     def run(self, output_dir: Optional[str] = None, render: Optional[bool] = None) -> Dict:
         render_enabled = self.config.enable_pygame if render is None else render
